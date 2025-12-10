@@ -4,3 +4,10 @@ rustflags = ["--cfg", "tokio_unstable"]
 
 [env]
 SENTRY_DSN = { value = "PLEASE DEFINE AT COMPILE TIME" }
+
+[target.aarch64-apple-ios]
+rustflags = [
+    "-C", "link-arg=-target",
+    "-C", "link-arg=arm64-apple-ios13.0",
+    "-C", "link-arg=-miphoneos-version-min=13.0"
+]
