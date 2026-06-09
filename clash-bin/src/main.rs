@@ -23,7 +23,7 @@ use std::{
     process::exit,
 };
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[clap(author, about, long_about = None)]
 struct Cli {
     #[clap(short, long, value_parser, value_name = "DIRECTORY")]
@@ -78,13 +78,28 @@ struct Cli {
 
     #[clap(
         long,
-        value_parser,
-        action = clap::ArgAction::SetTrue,
         help = "Enable compatibility mode, which make behaviors more consistent \
                 with mihomo but may cause some issues. It is recommended to enable \
                 this if you are using clash verge."
     )]
     compatibility: bool,
+
+    #[clap(
+        long,
+        help = "Reject configuration files that contain unrecognised fields. By \
+                default clash-rs silently ignores unknown fields so that profiles \
+                shared with other clients (e.g. clash-for-android) load without \
+                errors."
+    )]
+    strict_config: bool,
+}
+
+/// Returns `true` if the env var is set to `1` or `true` (case-insensitive).
+fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true"),
+        Err(_) => false,
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -100,7 +115,13 @@ fn main() -> anyhow::Result<()> {
             _ => arg,
         })
         .collect();
-    let cli = Cli::parse_from(args);
+    let mut cli = Cli::parse_from(args);
+
+    // Either `--compatibility` OR `CLASH_RS_COMPATIBILITY_MODE=1|true` enables
+    // compatibility mode. The env var is useful when the command line is fixed
+    // (containers, init systems, GUI launchers).
+    cli.compatibility =
+        cli.compatibility || env_truthy("CLASH_RS_COMPATIBILITY_MODE");
 
     if cli.version {
         println!(
@@ -140,8 +161,17 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    let parse_config = || {
+        let cfg = clash::Config::File(file.clone());
+        if cli.strict_config {
+            cfg.try_parse_strict()
+        } else {
+            cfg.try_parse()
+        }
+    };
+
     if cli.test_config {
-        match clash::Config::File(file.clone()).try_parse() {
+        match parse_config() {
             Ok(_) => {
                 println!("configuration file {file} test is successful");
                 exit(0);
@@ -174,21 +204,94 @@ fn main() -> anyhow::Result<()> {
         )));
     }
 
-    let mut config = clash::Config::File(file).try_parse()?;
+    let mut config = parse_config()?;
 
     config.general.controller.external_controller_ipc = cli.controller_ipc;
-
     if cli.compatibility {
-        config.general.mmdb = Some("Country.mmdb".to_string());
-        config.general.geosite = Some("geosite.dat".to_string());
+        println!(
+            "Compatibility mode enabled. This may cause some issues, but it is \
+             recommended to enable this if you are using clash verge."
+        );
+        if let Some(dir) = &cli.directory {
+            // Canonicalize to an absolute path before changing the process cwd.
+            // If `dir` is relative (e.g. `./clash-bin/tests/data/config`),
+            // calling set_current_dir then passing the same relative string as
+            // `cwd` to start_scaffold would cause paths like
+            // `cwd.join("Country.mmdb")` to be resolved from the *new* process
+            // cwd, doubling the directory segments and producing a path that
+            // doesn't exist (os error 2).
+            let abs = std::fs::canonicalize(dir)?;
+            std::env::set_current_dir(&abs)?;
+        }
+        if config.general.mmdb.is_none() {
+            config.general.mmdb = Some("Country.mmdb".to_string());
+        }
+        if config.general.geosite.is_none() {
+            config.general.geosite = Some("geosite.dat".to_string());
+        }
     }
+
+    // When compatibility mode called set_current_dir the process cwd is
+    // already correct; pass None so start_scaffold uses "." (= the new cwd)
+    // rather than the original relative cli.directory which would be resolved
+    // from the wrong base.
+    let cwd = if cli.compatibility && cli.directory.is_some() {
+        None
+    } else {
+        cli.directory.map(|x| x.to_string_lossy().to_string())
+    };
 
     clash::start_scaffold(clash::Options {
         config: clash::Config::Internal(config),
-        cwd: cli.directory.map(|x| x.to_string_lossy().to_string()),
+        cwd,
         rt: Some(TokioRuntime::MultiThread),
         log_file: cli.log_file,
+        config_path: Some(file),
     })
     .inspect_err(|err| eprintln!("Failed to start clash: {err}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod env_truthy_tests {
+    use super::env_truthy;
+    use std::sync::Mutex;
+
+    const KEY: &str = "CLASH_RS_COMPATIBILITY_MODE_TEST";
+    // Cargo runs tests in parallel — serialize env-var mutation within this
+    // module so the three cases don't observe each other's writes.
+    static GUARD: Mutex<()> = Mutex::new(());
+
+    fn with<F: FnOnce()>(value: Option<&str>, f: F) {
+        let _g = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        match value {
+            Some(v) => unsafe { std::env::set_var(KEY, v) },
+            None => unsafe { std::env::remove_var(KEY) },
+        }
+        f();
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn unset_is_false() {
+        with(None, || assert!(!env_truthy(KEY)));
+    }
+
+    #[test]
+    fn accepts_one_and_true_case_insensitive() {
+        for v in ["1", "true", "TRUE", "True", " true ", "  1 "] {
+            with(Some(v), || {
+                assert!(env_truthy(KEY), "{v:?} should be truthy")
+            });
+        }
+    }
+
+    #[test]
+    fn rejects_other_values() {
+        for v in ["0", "false", "yes", "on", "", "2", "truthy"] {
+            with(Some(v), || {
+                assert!(!env_truthy(KEY), "{v:?} should be falsy")
+            });
+        }
+    }
 }

@@ -8,28 +8,32 @@ mod system;
 #[path = "system.rs"]
 mod system;
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 pub use enhanced::EnhancedResolver;
 pub use system::SystemResolver;
 
 use super::{Config, ThreadSafeDNSResolver};
 use crate::{
-    app::profile::ThreadSafeCacheFile, common::mmdb::MmdbLookup, print_and_exit,
-    proxy::OutboundHandler,
+    app::profile::ThreadSafeCacheFile,
+    dns::{RuleDispatch, filters::PendingMmdb},
+    print_and_exit,
+    proxy::utils::OutboundHandlerRegistry,
 };
 
 pub async fn new(
     cfg: Config,
     store: Option<ThreadSafeCacheFile>,
-    mmdb: Option<MmdbLookup>,
-    outbounds: HashMap<String, Arc<dyn OutboundHandler>>,
+    mmdb: Option<PendingMmdb>,
+    outbounds: OutboundHandlerRegistry,
+    rule_dispatch: Option<Arc<RuleDispatch>>,
 ) -> ThreadSafeDNSResolver {
     if cfg.enable {
         match store {
-            Some(store) => {
-                Arc::new(EnhancedResolver::new(cfg, store, mmdb, outbounds).await)
-            }
+            Some(store) => Arc::new(
+                EnhancedResolver::new(cfg, store, mmdb, outbounds, rule_dispatch)
+                    .await,
+            ),
             _ => print_and_exit!("enhanced resolver requires cache store"),
         }
     } else {

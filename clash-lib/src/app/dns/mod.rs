@@ -15,10 +15,14 @@ mod fakeip;
 mod filters;
 mod helper;
 pub mod resolver;
+mod rule_dispatch;
 mod runtime;
 mod server;
 
 pub use config::{Config, EdnsClientSubnet};
+
+pub use filters::PendingMmdb;
+pub use rule_dispatch::{PendingOutboundManager, PendingRouter, RuleDispatch};
 
 pub use resolver::{EnhancedResolver, SystemResolver, new as new_resolver};
 
@@ -79,4 +83,10 @@ pub trait ClashResolver: Sync + Send {
     fn set_ipv6(&self, enable: bool);
 
     fn kind(&self) -> ResolverKind;
+}
+
+/// Returns the IP address if `host` is a valid IP literal, otherwise `None`.
+/// Used by resolvers to short-circuit DNS resolution for IP literals.
+pub(crate) fn parse_ip_literal(host: &str) -> Option<std::net::IpAddr> {
+    host.parse().ok()
 }

@@ -290,11 +290,16 @@ async fn handle_inbound_datagram(
                     //     warn!("Connection from {} is not allowed", meta.addr);
                     //     continue;
                     // }
-                    for chunk in buf[0..meta.len].chunks(meta.stride) {
+                    let chunk_size = gro_chunk_size(meta.len, meta.stride);
+                    if chunk_size == 0 {
+                        continue;
+                    }
+                    for chunk in buf[0..meta.len].chunks(chunk_size) {
                         let pkt = UdpPacket {
                             data: chunk.to_vec(),
                             src_addr: meta.addr.to_canonical().into(),
                             dst_addr: orig_dst.to_canonical().into(),
+                            inbound_user: None,
                         };
                         trace!("tproxy -> dispatcher: {:?}", pkt);
                         match d_tx.send(pkt).await {
@@ -324,6 +329,10 @@ async fn handle_inbound_datagram(
 
     let _ = futures::future::join(fut1, fut2).await;
     Ok(())
+}
+
+fn gro_chunk_size(len: usize, stride: usize) -> usize {
+    if stride == 0 { len } else { stride }
 }
 
 fn set_ip_recv_orig_dstaddr(
@@ -381,6 +390,21 @@ async fn handle_packet_from_dispatcher(
                 tracing::error!("dispatcher channel to tproxy is closed");
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gro_chunk_size;
+
+    #[test]
+    fn gro_chunk_size_uses_len_when_stride_is_zero() {
+        assert_eq!(gro_chunk_size(1024, 0), 1024);
+    }
+
+    #[test]
+    fn gro_chunk_size_uses_stride_when_non_zero() {
+        assert_eq!(gro_chunk_size(1024, 128), 128);
     }
 }
 

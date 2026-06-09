@@ -1,6 +1,8 @@
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http::uri::InvalidUri;
 
 use crate::{
+    Error,
     config::proxy::{CommonConfigOptions, GrpcOpt, H2Opt, WsOpt},
     proxy::transport::{self, GrpcClient, H2Client, WsClient},
 };
@@ -41,10 +43,7 @@ impl TryFrom<(Option<String>, &GrpcOpt, &CommonConfigOptions)> for GrpcClient {
         let (sni, x, common) = opt;
         let client = transport::GrpcClient::new(
             sni.as_ref().unwrap_or(&common.server).to_owned(),
-            x.grpc_service_name
-                .as_ref()
-                .map(|x| x.to_owned())
-                .unwrap_or_default()
+            format!("/{}", x.grpc_service_name.as_deref().unwrap_or_default())
                 .try_into()?,
         );
         Ok(client)
@@ -70,4 +69,21 @@ impl TryFrom<(&H2Opt, &CommonConfigOptions)> for H2Client {
             path.try_into()?,
         ))
     }
+}
+
+pub fn decode_base64_public_key(base64_public_key: &str) -> Result<[u8; 32], Error> {
+    URL_SAFE_NO_PAD
+        .decode(base64_public_key)
+        .map_err(|e| {
+            Error::InvalidConfig(format!("reality public-key base64: {e}"))
+        })?
+        .try_into()
+        .map_err(|_| {
+            Error::InvalidConfig("reality public-key must decode to 32 bytes".into())
+        })
+}
+
+pub fn decode_short_id(hex_short_id: &str) -> Result<Vec<u8>, Error> {
+    hex::decode(hex_short_id)
+        .map_err(|e| Error::InvalidConfig(format!("reality short-id hex: {e}")))
 }

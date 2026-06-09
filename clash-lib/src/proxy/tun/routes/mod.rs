@@ -38,8 +38,12 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
         #[cfg(target_os = "linux")]
         linux::check_ip_command_installed()?;
 
-        let tun_iface =
-            get_interface_by_name(tun_name).expect("tun interface not found");
+        let tun_iface = get_interface_by_name(tun_name).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("tun interface {} not found", tun_name),
+            )
+        })?;
 
         if cfg.route_all {
             warn!(
@@ -97,12 +101,6 @@ pub fn maybe_add_routes(cfg: &TunConfig, tun_name: &str) -> std::io::Result<()> 
                         );
                         let name_server = vec!["1.1.1.1".parse().unwrap()];
                         let _ = windows::set_dns_v4(&tun_iface, &name_server)
-                            .map_err(|e| {
-                                tracing::error!("failed to set dns due to:{}", e)
-                            });
-                        let name_server_v6 =
-                            vec!["2606:4700:4700::1111".parse().unwrap()];
-                        let _ = windows::set_dns_v6(&tun_iface, &name_server_v6)
                             .map_err(|e| {
                                 tracing::error!("failed to set dns due to:{}", e)
                             });

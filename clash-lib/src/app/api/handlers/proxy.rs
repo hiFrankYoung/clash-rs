@@ -11,10 +11,15 @@ use axum::{
 
 use http::{HeaderMap, StatusCode, header};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
     app::{
-        api::AppState, outbound::manager::ThreadSafeOutboundManager,
+        api::{
+            AppState,
+            handlers::utils::{DelayRequest, group_url_test},
+        },
+        outbound::manager::ThreadSafeOutboundManager,
         profile::ThreadSafeCacheFile,
     },
     proxy::AnyOutboundHandler,
@@ -65,7 +70,7 @@ async fn find_proxy_by_name(
     next: Next,
 ) -> Response {
     let outbound_manager = state.outbound_manager.clone();
-    match outbound_manager.get_outbound(&name) {
+    match outbound_manager.get_outbound(&name).await {
         Some(proxy) => {
             req.extensions_mut().insert(proxy);
             next.run(req).await
@@ -102,8 +107,11 @@ async fn update_proxy(
                 cache_store.set_selected(proxy.name(), &payload.name).await;
                 (
                     StatusCode::ACCEPTED,
-                    format!("selected proxy {} for {}", payload.name, proxy.name()),
+                    axum::response::Json(json!({
+                        "message": format!("selected proxy {} for {}", payload.name, proxy.name())
+                    })),
                 )
+                    .into_response()
             }
             Err(err) => (
                 StatusCode::BAD_REQUEST,
@@ -113,20 +121,17 @@ async fn update_proxy(
                     proxy.name(),
                     err
                 ),
-            ),
+            )
+                .into_response(),
         },
         _ => (
             StatusCode::NOT_FOUND,
             format!("proxy {} is not a Select", proxy.name()),
-        ),
+        )
+            .into_response(),
     }
 }
 
-#[derive(Deserialize)]
-struct DelayRequest {
-    url: String,
-    timeout: u16,
-}
 async fn get_proxy_delay(
     State(state): State<ProxyState>,
     Extension(proxy): Extension<AnyOutboundHandler>,
@@ -134,27 +139,18 @@ async fn get_proxy_delay(
 ) -> impl IntoResponse {
     let outbound_manager = state.outbound_manager.clone();
     let timeout = Duration::from_millis(q.timeout.into());
-    let n = proxy.name().to_owned();
+    let name = proxy.name().to_owned();
     let mut headers = HeaderMap::new();
     headers.insert(header::CONNECTION, "close".parse().unwrap());
 
-    let (actual, overall) = if let Some(group) = proxy.try_as_group_handler() {
-        let latency_test_url = group.get_latency_test_url();
-        let proxies = group.get_proxies().await;
-        let results = outbound_manager
-            .url_test(
-                &[vec![proxy], proxies].concat(),
-                &latency_test_url.unwrap_or(q.url),
-                timeout,
-            )
-            .await;
-        match results.first().unwrap() {
-            Ok(latency) => *latency,
+    let (actual, overall) = if proxy.try_as_group_handler().is_some() {
+        match group_url_test(&outbound_manager, proxy, &q.url, timeout).await {
+            Ok(latency) => latency,
             Err(err) => {
                 return (
                     StatusCode::BAD_REQUEST,
                     headers,
-                    format!("get delay for {n} failed with error: {err}"),
+                    format!("get delay for {name} failed with error: {err}"),
                 )
                     .into_response();
             }
@@ -163,13 +159,13 @@ async fn get_proxy_delay(
         let result = outbound_manager
             .url_test(&vec![proxy], &q.url, timeout)
             .await;
-        match result.first().unwrap() {
+        match result.first().expect("there must be at least one proxy") {
             Ok(latency) => *latency,
             Err(err) => {
                 return (
                     StatusCode::BAD_REQUEST,
                     headers,
-                    format!("get delay for {n} failed with error: {err}"),
+                    format!("get delay for {name} failed with error: {err}"),
                 )
                     .into_response();
             }

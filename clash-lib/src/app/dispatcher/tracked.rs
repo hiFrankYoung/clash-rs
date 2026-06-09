@@ -51,7 +51,6 @@ impl<T> ChainedStreamWrapper<T> {
         }
     }
 
-    #[allow(unused)]
     pub fn inner_mut(&mut self) -> &mut T {
         &mut self.inner
     }
@@ -118,7 +117,6 @@ pub struct TrackedStream {
     close_notify: Receiver<()>,
 }
 
-#[allow(unused)]
 impl TrackedStream {
     #[allow(clippy::borrowed_box)]
     pub async fn new(
@@ -217,6 +215,11 @@ impl ReadTracker {
         self.tracker
             .download_total
             .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_download
+                .fetch_add(download as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -236,6 +239,11 @@ impl WriteTracker {
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_upload
+                .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -272,6 +280,11 @@ impl AsyncRead for TrackedStream {
         self.tracker
             .download_total
             .fetch_add(download as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_download
+                .fetch_add(download as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         v
     }
@@ -302,6 +315,11 @@ impl AsyncWrite for TrackedStream {
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Release);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_upload
+                .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        }
 
         v
     }
@@ -501,11 +519,16 @@ impl Stream for TrackedDatagram {
 
         let r = Pin::new(self.inner.as_mut()).poll_next(cx);
         if let Poll::Ready(Some(ref pkt)) = r {
-            self.manager.push_downloaded(pkt.data.len());
-            self.tracker.download_total.fetch_add(
-                pkt.data.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let n = pkt.data.len();
+            self.manager.push_downloaded(n);
+            self.tracker
+                .download_total
+                .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            if self.tracker.session_holder.inbound_user.is_some() {
+                self.tracker
+                    .user_download
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         r
     }
@@ -549,6 +572,11 @@ impl Sink<UdpPacket> for TrackedDatagram {
         self.tracker
             .upload_total
             .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        if self.tracker.session_holder.inbound_user.is_some() {
+            self.tracker
+                .user_upload
+                .fetch_add(upload as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         Pin::new(self.inner.as_mut()).start_send(item)
     }
 

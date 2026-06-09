@@ -6,7 +6,6 @@ use crate::{
     config::def::{DNSListen, DNSMode, EdnsClientSubnet as DefEdnsClientSubnet},
 };
 use ipnet::{AddrParseError, Ipv4Net, Ipv6Net};
-use serde::Deserialize;
 use std::{
     collections::HashMap,
     fmt::Display,
@@ -59,6 +58,7 @@ pub struct Config {
     pub listen: DNSListenAddr,
     pub enhance_mode: DNSMode,
     pub default_nameserver: Vec<NameServer>,
+    pub proxy_server_nameserver: Option<Vec<NameServer>>,
     pub fake_ip_range: ipnet::IpNet,
     pub fake_ip_filter: Vec<String>,
     pub store_fake_ip: bool,
@@ -67,6 +67,7 @@ pub struct Config {
     pub nameserver_policy: HashMap<String, NameServer>,
     pub edns_client_subnet: Option<EdnsClientSubnet>,
     pub fw_mark: Option<u32>,
+    pub respect_rules: bool,
 }
 
 impl Config {
@@ -313,6 +314,21 @@ impl TryFrom<&crate::config::def::Config> for Config {
             }
         }
 
+        // Domain hostnames are allowed here: they are bootstrapped through
+        // `default-nameserver` at client-construction time, mirroring how
+        // `nameserver` resolves its own DoH/DoT hosts.
+        let proxy_server_nameserver = if !dc.proxy_server_nameserver.is_empty() {
+            let ns = Config::parse_nameserver(&dc.proxy_server_nameserver)?;
+            if ns.is_empty() {
+                return Err(Error::InvalidConfig(String::from(
+                    "proxy-server-nameserver has no usable entries (all skipped)",
+                )));
+            }
+            Some(ns)
+        } else {
+            None
+        };
+
         let edns_client_subnet = dc
             .edns_client_subnet
             .as_ref()
@@ -329,103 +345,96 @@ impl TryFrom<&crate::config::def::Config> for Config {
             listen: dc
                 .listen
                 .clone()
-                .map(|l| match l {
-                    DNSListen::Udp(u) => {
-                        let addr = parse_listen_addr(&u)?;
-                        Ok(DNSListenAddr {
-                            udp: Some(addr),
-                            ..Default::default()
-                        })
-                    }
-                    DNSListen::Multiple(map) => {
-                        let mut udp = None;
-                        let mut tcp = None;
-                        let mut doh = None;
-                        let mut doh3 = None;
-                        let mut dot = None;
-
-                        for (k, v) in map {
-                            match k.as_str() {
-                                "udp" => {
-                                    let addr = v
-                                        .as_str()
-                                        .ok_or(Error::InvalidConfig(format!(
-                                            "invalid udp dns listen address - must \
-                                             be string: {v:?}"
-                                        )))
-                                        .and_then(parse_listen_addr)?;
-                                    udp = Some(addr)
-                                }
-                                "tcp" => {
-                                    let addr = v
-                                        .as_str()
-                                        .ok_or(Error::InvalidConfig(format!(
-                                            "invalid tcp dns listen address - must \
-                                             be string: {v:?}"
-                                        )))
-                                        .and_then(parse_listen_addr)?;
-                                    tcp = Some(addr)
-                                }
-                                "doh" => {
-                                    let c =
-                                        DoHConfig::deserialize(v).map_err(|x| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid doh dns listen config: \
-                                                 {x:?}"
-                                            ))
-                                        })?;
-
-                                    doh = Some(c)
-                                }
-                                "dot" => {
-                                    let c =
-                                        DoTConfig::deserialize(v).map_err(|x| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid dot dns listen config: \
-                                                 {x:?}"
-                                            ))
-                                        })?;
-                                    dot = Some(c)
-                                }
-                                "doh3" => {
-                                    let c =
-                                        DoH3Config::deserialize(v).map_err(|x| {
-                                            Error::InvalidConfig(format!(
-                                                "invalid doh3 dns listen config: \
-                                                 {x:?}"
-                                            ))
-                                        })?;
-
-                                    doh3 = Some(c)
-                                }
-                                _ => {
-                                    return Err(Error::InvalidConfig(format!(
-                                        "invalid dns listen address: {k}"
-                                    )));
-                                }
-                            }
+                .map(|l| -> Result<DNSListenAddr, Error> {
+                    match l {
+                        DNSListen::Udp(u) => {
+                            let addr = parse_listen_addr(&u)?;
+                            Ok(DNSListenAddr {
+                                udp: Some(addr),
+                                ..Default::default()
+                            })
                         }
-
-                        Ok(DNSListenAddr {
-                            udp,
-                            tcp,
-                            doh,
-                            dot,
-                            doh3,
-                        })
+                        DNSListen::Multiple(m) => {
+                            let udp = m
+                                .udp
+                                .as_deref()
+                                .map(parse_listen_addr)
+                                .transpose()?;
+                            let tcp = m
+                                .tcp
+                                .as_deref()
+                                .map(parse_listen_addr)
+                                .transpose()?;
+                            // DoHConfig and DoH3Config have identical fields; helper
+                            // avoids duplication.
+                            let map_doh_fields =
+                                |c: crate::config::def::DohListenDef| {
+                                    parse_listen_addr(&c.addr).map(|addr| {
+                                        (addr, c.ca_cert, c.ca_key, c.hostname)
+                                    })
+                                };
+                            let doh = m
+                                .doh
+                                .map(|c| {
+                                    map_doh_fields(c).map(
+                                        |(addr, ca_cert, ca_key, hostname)| {
+                                            DoHConfig {
+                                                addr,
+                                                ca_cert,
+                                                ca_key,
+                                                hostname,
+                                            }
+                                        },
+                                    )
+                                })
+                                .transpose()?;
+                            let dot = m
+                                .dot
+                                .map(|c| -> Result<DoTConfig, Error> {
+                                    Ok(DoTConfig {
+                                        addr: parse_listen_addr(&c.addr)?,
+                                        ca_cert: c.ca_cert,
+                                        ca_key: c.ca_key,
+                                    })
+                                })
+                                .transpose()?;
+                            let doh3 = m
+                                .doh3
+                                .map(|c| {
+                                    map_doh_fields(c).map(
+                                        |(addr, ca_cert, ca_key, hostname)| {
+                                            DoH3Config {
+                                                addr,
+                                                ca_cert,
+                                                ca_key,
+                                                hostname,
+                                            }
+                                        },
+                                    )
+                                })
+                                .transpose()?;
+                            Ok(DNSListenAddr {
+                                udp,
+                                tcp,
+                                doh,
+                                dot,
+                                doh3,
+                            })
+                        }
                     }
                 })
                 .transpose()?
                 .unwrap_or_default(),
             enhance_mode: dc.enhanced_mode.clone(),
             default_nameserver,
+            proxy_server_nameserver,
             fake_ip_range: dc.fake_ip_range.parse::<ipnet::IpNet>().map_err(
                 |_| Error::InvalidConfig(String::from("invalid fake ip range")),
             )?,
             fake_ip_filter: dc.fake_ip_filter.clone(),
             store_fake_ip: c.profile.store_fake_ip,
             store_smart_stats: c.profile.store_smart_stats,
-            hosts: if dc.user_hosts && !c.hosts.is_empty() {
+            hosts: if dc.use_hosts && !c.hosts.is_empty() {
                 Config::parse_hosts(&c.hosts).ok()
             } else {
                 let mut tree = trie::StringTrie::new();
@@ -437,6 +446,7 @@ impl TryFrom<&crate::config::def::Config> for Config {
             },
             nameserver_policy,
             edns_client_subnet,
+            respect_rules: dc.respect_rules,
         })
     }
 }

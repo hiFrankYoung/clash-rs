@@ -9,6 +9,7 @@ use axum::{
 
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -154,30 +155,20 @@ async fn update_configs(
     State(state): State<ConfigState>,
     Json(req): Json<UpdateConfigRequest>,
 ) -> impl IntoResponse {
-    let (done, wait) = tokio::sync::oneshot::channel();
-    let g = state.global_state.lock().await;
-    match (req.path, req.payload) {
-        (_, Some(payload)) => {
-            let msg = "config reloading from payload".to_string();
-            let cfg = crate::Config::Str(payload);
-            match g.reload_tx.send((cfg, done)).await {
-                Ok(_) => {
-                    wait.await.unwrap();
-                    (StatusCode::NO_CONTENT, msg).into_response()
-                }
-                Err(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not signal config reload",
-                )
-                    .into_response(),
-            }
-        }
-        (Some(mut path), None) => {
+    // Extract only what we need, then drop the lock before the async reload.
+    let (reload_tx, cwd, config_path) = {
+        let g = state.global_state.lock().await;
+        (g.reload_tx.clone(), g.cwd.clone(), g.config_path.clone())
+    };
+
+    let cfg = match (req.path.as_deref(), req.payload) {
+        (_, Some(payload)) => crate::Config::Str(payload),
+
+        // Non-empty explicit path: validate and reload from that file.
+        (Some(p), None) if !p.is_empty() => {
+            let mut path = p.to_string();
             if !PathBuf::from(&path).is_absolute() {
-                path = PathBuf::from(g.cwd.clone())
-                    .join(path)
-                    .to_string_lossy()
-                    .to_string();
+                path = PathBuf::from(&cwd).join(path).to_string_lossy().to_string();
             }
             if !PathBuf::from(&path).exists() {
                 return (
@@ -186,25 +177,41 @@ async fn update_configs(
                 )
                     .into_response();
             }
-
-            let msg = format!("config reloading from file {path}");
-            let cfg: crate::Config = crate::Config::File(path);
-            match g.reload_tx.send((cfg, done)).await {
-                Ok(_) => {
-                    wait.await.unwrap();
-                    (StatusCode::NO_CONTENT, msg).into_response()
-                }
-
-                Err(_) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "could not signal config reload",
+            if PathBuf::from(&path).is_dir() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("config path {path} is a directory"),
                 )
-                    .into_response(),
+                    .into_response();
             }
+            crate::Config::File(path)
         }
-        (None, None) => {
-            (StatusCode::BAD_REQUEST, "no path or payload provided").into_response()
-        }
+
+        // Empty path or no path: reload from the startup config file.
+        _ => match config_path {
+            Some(p) => crate::Config::File(p),
+            None => {
+                return (StatusCode::BAD_REQUEST, "no path or payload provided")
+                    .into_response();
+            }
+        },
+    };
+
+    let (done, wait) = tokio::sync::oneshot::channel();
+    match reload_tx.send((cfg, done)).await {
+        Ok(_) => match wait.await {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config reload did not complete",
+            )
+                .into_response(),
+        },
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not signal config reload",
+        )
+            .into_response(),
     }
 }
 
@@ -277,8 +284,6 @@ async fn patch_configs(
         }
     }
 
-    let mut global_state = state.global_state.lock().await;
-
     if payload.rebuild_listeners() {
         let ports = Ports {
             port: payload.port,
@@ -287,33 +292,44 @@ async fn patch_configs(
             tproxy_port: payload.tproxy_port,
             mixed_port: payload.mixed_port,
         };
-        inbound_manager.change_ports(ports).await;
-        need_restart = true;
+        let changed = inbound_manager.change_ports(ports).await;
+        need_restart |= changed;
     }
 
     if let Some(allow_lan) = payload.allow_lan
         && allow_lan != inbound_manager.get_allow_lan().await
     {
         inbound_manager.set_allow_lan(allow_lan).await;
-        // TODO: can be done with AtomicBool, but requires more changes
+        // TODO: can be done with AtomicBool in each inbound manager, but requires
+        // more changes
         need_restart = true;
+    }
+
+    // Apply mode change before restarting listeners so that new connections
+    // established after the restart immediately use the updated mode.
+    if let Some(mode) = payload.mode {
+        state.dispatcher.set_mode(mode).await;
     }
 
     if need_restart {
         let _ = inbound_manager.restart().await;
     }
 
-    if let Some(mode) = payload.mode {
-        state.dispatcher.set_mode(mode).await;
-    }
-
-    if let Some(log_level) = payload.log_level {
-        global_state.log_level = log_level;
-    }
-
     if let Some(ipv6) = payload.ipv6 {
         state.dns_resolver.set_ipv6(ipv6);
     }
 
-    StatusCode::ACCEPTED.into_response()
+    // Only lock global_state for the small section that actually needs it.
+    // Holding it across inbound_manager.restart() (which can be slow) was
+    // blocking concurrent GET /configs requests unnecessarily.
+    if let Some(log_level) = payload.log_level {
+        let mut global_state = state.global_state.lock().await;
+        global_state.log_level = log_level;
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        axum::response::Json(json!({"message": "configs updated"})),
+    )
+        .into_response()
 }
